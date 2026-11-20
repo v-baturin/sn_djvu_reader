@@ -34,7 +34,10 @@
 <div id="jumpDialog" role="dialog" aria-modal="true" aria-labelledby="jumpLabel" hidden><div id="jumpCard"><label id="jumpLabel" for="jumpInput">Go to page</label><input id="jumpInput" type="number" inputmode="numeric" min="1" step="1"><div id="jumpError" role="alert"></div><div id="jumpActions"><button id="jumpCancel">Cancel</button><button id="jumpGo">Go</button></div></div></div>
 </div><script>/* DJVU_DECODER */</script><script>
 (function () {
-  const send = data => window.ReactNativeWebView.postMessage(JSON.stringify(data));
+  const send = data => {
+    const host = window.AndroidBridge || window.ReactNativeWebView;
+    if (host) host.postMessage(JSON.stringify(data));
+  };
   const status = document.getElementById('status');
   const canvas = document.getElementById('page');
   const inkCanvas = document.getElementById('ink');
@@ -180,6 +183,7 @@
     clearTimeout(penRegionTimer);
     penRegionTimer = setTimeout(sendPenRegion, 100);
   }
+  window.refreshPenRegion = queuePenRegion;
 
   function saveViewState() {
     if (!viewStateReady || !doc) return;
