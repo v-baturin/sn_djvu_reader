@@ -1,0 +1,11 @@
+{
+  "name": "DjvuReader",
+  "desc": "Offline DjVu reader for Supernote",
+  "iconPath": "assets/icon.png",
+  "versionName": "0.2.1",
+  "versionCode": "7",
+  "uses-permissions": ["plugin.permission.FILE:READ"],
+  "pluginID": "djvureader2026sn",
+  "pluginKey": "DjvuReader",
+  "jsMainPath": "index"
+}

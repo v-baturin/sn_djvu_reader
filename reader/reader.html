@@ -1,0 +1,615 @@
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #fff; color: #111; font-family: sans-serif; }
+  #root { height: 100%; display: flex; flex-direction: column; }
+  #status { padding: 8px 12px; min-height: 38px; font-size: 17px; border-bottom: 1px solid #888; }
+  #pageArea { flex: 1; overflow: auto; text-align: center; background: #eee; }
+  #pageWrap { position: relative; margin: 0 auto; width: 0; height: 0; }
+  canvas { display: block; max-width: none; }
+  #page { background: #fff; }
+  #ink { position: absolute; top: 0; left: 0; background: transparent; pointer-events: none; }
+  #ink.editing { pointer-events: auto; touch-action: none; }
+  #controls { display: flex; justify-content: space-around; align-items: center; border-top: 1px solid #888; height: 64px; flex-shrink: 0; }
+  #inkControls { display: flex; justify-content: space-around; align-items: center; border-top: 1px solid #888; height: 60px; flex-shrink: 0; }
+  button { min-width: 72px; min-height: 48px; border: 1px solid #555; border-radius: 6px; background: #fff; color: #111; font-size: 20px; }
+  button:disabled { color: #aaa; border-color: #ccc; }
+  button.active { background: #222; color: #fff; }
+  #fitWidth, #fitHeight { min-width: 104px; font-size: 16px; }
+  #counter { min-width: 90px; }
+  #jumpDialog[hidden] { display: none; }
+  #jumpDialog { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; background: #0007; }
+  #jumpCard { width: min(90vw, 400px); padding: 24px; background: #fff; border: 1px solid #555; border-radius: 8px; text-align: left; }
+  #jumpCard label { display: block; font-size: 22px; margin-bottom: 12px; }
+  #jumpInput { width: 100%; height: 52px; padding: 8px 12px; border: 1px solid #555; border-radius: 6px; font-size: 24px; }
+  #jumpError { min-height: 24px; margin: 8px 0; color: #a00; font-size: 16px; }
+  #jumpActions { display: flex; justify-content: flex-end; gap: 12px; }
+  #root.toolbarsHidden #status, #root.toolbarsHidden #controls, #root.toolbarsHidden #inkControls { display: none; }
+</style></head><body><div id="root">
+<div id="status">Select a DjVu file</div>
+<div id="pageArea"><div id="pageWrap"><canvas id="page"></canvas><canvas id="ink" class="editing"></canvas></div></div>
+<div id="controls"><button id="prev" disabled>◀</button><button id="minus" disabled>−</button><button id="fitWidth" class="active" disabled>Fit Width</button><button id="counter" aria-label="Jump to page" disabled>– / –</button><button id="fitHeight" disabled>Fit Height</button><button id="plus" disabled>+</button><button id="next" disabled>▶</button></div>
+<div id="inkControls"><button id="eraseMode">Erase</button><button id="undo" disabled>Undo</button><button id="clear" disabled>Clear</button></div>
+<div id="jumpDialog" role="dialog" aria-modal="true" aria-labelledby="jumpLabel" hidden><div id="jumpCard"><label id="jumpLabel" for="jumpInput">Go to page</label><input id="jumpInput" type="number" inputmode="numeric" min="1" step="1"><div id="jumpError" role="alert"></div><div id="jumpActions"><button id="jumpCancel">Cancel</button><button id="jumpGo">Go</button></div></div></div>
+</div><script>/* DJVU_DECODER */</script><script>
+(function () {
+  const send = data => window.ReactNativeWebView.postMessage(JSON.stringify(data));
+  const status = document.getElementById('status');
+  const canvas = document.getElementById('page');
+  const inkCanvas = document.getElementById('ink');
+  const pageWrap = document.getElementById('pageWrap');
+  const area = document.getElementById('pageArea');
+  const counter = document.getElementById('counter');
+  const jumpDialog = document.getElementById('jumpDialog');
+  const jumpInput = document.getElementById('jumpInput');
+  const jumpError = document.getElementById('jumpError');
+  const jumpCancel = document.getElementById('jumpCancel');
+  const jumpGo = document.getElementById('jumpGo');
+  const prev = document.getElementById('prev');
+  const next = document.getElementById('next');
+  const minus = document.getElementById('minus');
+  const plus = document.getElementById('plus');
+  const fitWidth = document.getElementById('fitWidth');
+  const fitHeight = document.getElementById('fitHeight');
+  const eraseMode = document.getElementById('eraseMode');
+  const undo = document.getElementById('undo');
+  const clear = document.getElementById('clear');
+  const root = document.getElementById('root');
+  let bytes, offset = 0, doc = null, page = 1, count = 0, zoom = 1, busy = false, fitMode = 'width';
+  let inks = {version: 1, pages: {}};
+  let mode = 'draw', currentStroke = null, activePointer = null;
+  let nativePenEditing = false;
+  let restoredView = {}, viewStateReady = false, viewStateTimer = null;
+  let hardwareInkPresent = false, penRegionTimer = null;
+  // Full-resolution pages are expensive to decode on the Manta. Keep the
+  // current page and its neighbours in a small, bounded image cache.
+  const imageCache = new Map();
+  const maxCacheBytes = 128 * 1024 * 1024;
+  let cachedBytes = 0, prefetchWorker = null, workerReady = null;
+  let prefetchTimer = null, prefetching = false;
+
+  function cachedImage(number) {
+    const image = imageCache.get(number);
+    if (image) { imageCache.delete(number); imageCache.set(number, image); }
+    return image;
+  }
+
+  function cacheImage(number, image) {
+    const size = image.data.byteLength;
+    if (size > maxCacheBytes) return;
+    const old = imageCache.get(number);
+    if (old) { cachedBytes -= old.data.byteLength; imageCache.delete(number); }
+    imageCache.set(number, image);
+    cachedBytes += size;
+    while (cachedBytes > maxCacheBytes || imageCache.size > 3) {
+      // Keep the visible page first, then favour the preceding page when
+      // a large scan leaves room for only one neighbour.
+      const victim = [...imageCache.keys()].reduce((worst, candidate) => {
+        const distance = Math.abs(candidate - page);
+        const worstDistance = Math.abs(worst - page);
+        return distance > worstDistance || (distance === worstDistance && candidate > worst)
+          ? candidate : worst;
+      });
+      cachedBytes -= imageCache.get(victim).data.byteLength;
+      imageCache.delete(victim);
+    }
+  }
+
+  function pruneDistantImages() {
+    for (const [number, image] of imageCache) {
+      if (Math.abs(number - page) > 1) {
+        cachedBytes -= image.data.byteLength;
+        imageCache.delete(number);
+      }
+    }
+  }
+
+  function startPrefetchWorker(buffer) {
+    if (typeof Worker !== 'function' || buffer.byteLength > 32 * 1024 * 1024) return;
+    try {
+      const worker = new DjVu.Worker();
+      prefetchWorker = worker;
+      workerReady = Promise.race([
+        worker.createDocument(buffer.slice(0)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Worker timeout')), 20000))
+      ]).then(() => send({type: 'prefetchStatus', message: 'worker ready'})).catch(error => {
+        send({type: 'prefetchStatus', message: 'worker failed: ' + String(error && error.message || error)});
+        worker.terminate();
+        if (prefetchWorker === worker) prefetchWorker = null;
+      });
+    } catch (error) {
+      send({type: 'prefetchStatus', message: 'worker unavailable: ' + String(error && error.message || error)});
+      prefetchWorker = null;
+    }
+  }
+
+  function queuePrefetch() {
+    clearTimeout(prefetchTimer);
+    if (!prefetchWorker) return;
+    prefetchTimer = setTimeout(prefetchNearPage, 300);
+  }
+
+  async function prefetchNearPage() {
+    if (prefetching || !prefetchWorker || !doc) return;
+    prefetching = true;
+    const center = page;
+    try {
+      await workerReady;
+      const worker = prefetchWorker;
+      if (!worker) return;
+      for (const number of [center - 1, center + 1]) {
+        if (number < 1 || number > count || imageCache.has(number)) continue;
+        const started = performance.now();
+        const image = await worker.doc.getPage(number).getImageData().run();
+        send({type: 'prefetchStatus', message: 'page ' + number + ' decoded in ' +
+          Math.round(performance.now() - started) + ' ms'});
+        if (Math.abs(number - page) <= 1 && !imageCache.has(number)) cacheImage(number, image);
+      }
+    } catch (error) {
+      send({type: 'prefetchStatus', message: 'page failed: ' + String(error && error.message || error)});
+      if (prefetchWorker) prefetchWorker.terminate();
+      prefetchWorker = null;
+    } finally {
+      prefetching = false;
+      if (page !== center && prefetchWorker) queuePrefetch();
+    }
+  }
+
+  function clearNativePreview(force = false) {
+    if (force || hardwareInkPresent) send({type: 'clearNativeInk'});
+    hardwareInkPresent = false;
+  }
+
+  function sendPenRegion() {
+    clearTimeout(penRegionTimer);
+    const pageRect = inkCanvas.getBoundingClientRect();
+    const viewport = area.getBoundingClientRect();
+    const left = Math.max(pageRect.left, viewport.left);
+    const top = Math.max(pageRect.top, viewport.top);
+    const right = Math.min(pageRect.right, viewport.right);
+    const bottom = Math.min(pageRect.bottom, viewport.bottom);
+    const enabled = !!doc && viewStateReady && !busy && jumpDialog.hidden && mode === 'draw' &&
+      right > left && bottom > top;
+    send({type: 'penRegion', enabled, bounds: enabled ?
+      [left / window.innerWidth, top / window.innerHeight,
+        right / window.innerWidth, bottom / window.innerHeight] : [0, 0, 0, 0]});
+  }
+
+  function queuePenRegion() {
+    clearTimeout(penRegionTimer);
+    penRegionTimer = setTimeout(sendPenRegion, 100);
+  }
+
+  function saveViewState() {
+    if (!viewStateReady || !doc) return;
+    send({type: 'saveViewState', state: {page, fitMode, zoom,
+      scrollTop: area.scrollTop, scrollLeft: area.scrollLeft, mode,
+      toolbarsVisible: !root.classList.contains('toolbarsHidden')}});
+  }
+
+  function pageStrokes() {
+    if (!Array.isArray(inks.pages[page])) inks.pages[page] = [];
+    return inks.pages[page];
+  }
+  function saveInk() { send({type: 'saveInk', ink: JSON.stringify(inks)}); }
+  function redrawInk() {
+    const context = inkCanvas.getContext('2d');
+    context.clearRect(0, 0, inkCanvas.width, inkCanvas.height);
+    context.strokeStyle = '#111';
+    context.fillStyle = '#111';
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    for (const stroke of pageStrokes()) {
+      if (!Array.isArray(stroke.points) || !stroke.points.length) continue;
+      const points = stroke.points;
+      const width = Math.max(1, (stroke.width || 0.003) * inkCanvas.width);
+      context.lineWidth = width;
+      if (points.length === 1) {
+        context.beginPath();
+        context.arc(points[0][0] * inkCanvas.width, points[0][1] * inkCanvas.height, width / 2, 0, Math.PI * 2);
+        context.fill();
+      } else {
+        context.beginPath();
+        context.moveTo(points[0][0] * inkCanvas.width, points[0][1] * inkCanvas.height);
+        for (let i = 1; i < points.length; i++) context.lineTo(points[i][0] * inkCanvas.width, points[i][1] * inkCanvas.height);
+        context.stroke();
+      }
+    }
+    undo.disabled = clear.disabled = !doc || pageStrokes().length === 0;
+  }
+  function drawNewInk(from, to, width) {
+    const context = inkCanvas.getContext('2d');
+    context.strokeStyle = '#111';
+    context.fillStyle = '#111';
+    context.lineWidth = Math.max(1, width * inkCanvas.width);
+    context.lineCap = 'round';
+    if (from) {
+      context.beginPath();
+      context.moveTo(from[0] * inkCanvas.width, from[1] * inkCanvas.height);
+      context.lineTo(to[0] * inkCanvas.width, to[1] * inkCanvas.height);
+      context.stroke();
+    } else {
+      context.beginPath();
+      context.arc(to[0] * inkCanvas.width, to[1] * inkCanvas.height, context.lineWidth / 2, 0, Math.PI * 2);
+      context.fill();
+    }
+  }
+  function drawFinishedInk(stroke) {
+    const points = stroke.points;
+    if (points.length === 1) { drawNewInk(null, points[0], stroke.width); return; }
+    const context = inkCanvas.getContext('2d');
+    context.strokeStyle = '#111';
+    context.lineWidth = Math.max(1, stroke.width * inkCanvas.width);
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    context.beginPath();
+    context.moveTo(points[0][0] * inkCanvas.width, points[0][1] * inkCanvas.height);
+    for (let i = 1; i < points.length; i++)
+      context.lineTo(points[i][0] * inkCanvas.width, points[i][1] * inkCanvas.height);
+    context.stroke();
+  }
+  function pointFromClient(clientX, clientY) {
+    const rect = inkCanvas.getBoundingClientRect();
+    return [Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+      Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))];
+  }
+  function eraseAt(point) {
+    const strokes = pageStrokes();
+    const threshold = 15 / Math.max(1, inkCanvas.getBoundingClientRect().width);
+    for (let i = strokes.length - 1; i >= 0; i--) {
+      const points = strokes[i].points || [];
+      if (points.some(item => Math.hypot((item[0] - point[0]), (item[1] - point[1]) * inkCanvas.height / inkCanvas.width) < threshold)) {
+        strokes.splice(i, 1);
+        redrawInk();
+        saveInk();
+        return;
+      }
+    }
+  }
+  function setMode(value) {
+    mode = value;
+    if (value === 'erase') clearNativePreview(true);
+    eraseMode.classList.toggle('active', value === 'erase');
+    sendPenRegion();
+    saveViewState();
+  }
+  window.nativePenEvent = (action, relativeX, relativeY, fastInk = false, trace = null) => {
+    const clientX = relativeX * window.innerWidth;
+    const clientY = relativeY * window.innerHeight;
+    if (action === 'down') {
+      activePointer = -1;
+      fingerDrag = null;
+      tapPointers.clear();
+      if (tapCandidate) clearTimeout(tapCandidate.timer);
+      tapCandidate = previousTap = null;
+      const rect = inkCanvas.getBoundingClientRect();
+      nativePenEditing = !!doc && !busy && jumpDialog.hidden &&
+        clientX >= rect.left && clientX <= rect.right &&
+        clientY >= rect.top && clientY <= rect.bottom;
+      if (!nativePenEditing) return;
+      const point = pointFromClient(clientX, clientY);
+      if (mode === 'draw') {
+        currentStroke = {width: 0.003, points: [point]};
+        pageStrokes().push(currentStroke);
+        if (!fastInk) drawNewInk(null, point, currentStroke.width);
+        undo.disabled = clear.disabled = false;
+      } else eraseAt(point);
+    } else if (action === 'move' && nativePenEditing && doc && !busy) {
+      const point = pointFromClient(clientX, clientY);
+      if (mode === 'draw' && currentStroke) {
+        const points = currentStroke.points;
+        const last = points[points.length - 1];
+        if (Math.hypot(point[0] - last[0], point[1] - last[1]) > 0.0005) {
+          points.push(point);
+          if (!fastInk) drawNewInk(last, point, currentStroke.width);
+        }
+      } else if (mode === 'erase') eraseAt(point);
+    } else if (action === 'up' || action === 'cancel') {
+      if (nativePenEditing && currentStroke && action === 'up') {
+        if (fastInk && Array.isArray(trace)) {
+          const points = [];
+          for (const item of trace) {
+            if (!Array.isArray(item) || item.length !== 2) continue;
+            const point = pointFromClient(item[0] * window.innerWidth, item[1] * window.innerHeight);
+            const last = points[points.length - 1];
+            if (!last || Math.hypot(point[0] - last[0], point[1] - last[1]) > 0.0002)
+              points.push(point);
+          }
+          currentStroke.points = points.length ? points : [pointFromClient(clientX, clientY)];
+          drawFinishedInk(currentStroke);
+          hardwareInkPresent = true;
+        } else {
+          const point = pointFromClient(clientX, clientY);
+          const points = currentStroke.points;
+          const last = points[points.length - 1];
+          if (Math.hypot(point[0] - last[0], point[1] - last[1]) > 0.0005) {
+            points.push(point);
+            drawNewInk(last, point, currentStroke.width);
+          }
+        }
+      }
+      if (action === 'cancel' && currentStroke) {
+        pageStrokes().pop();
+        if (fastInk) clearNativePreview(true);
+        redrawInk();
+      } else if (currentStroke) saveInk();
+      currentStroke = null;
+      nativePenEditing = false;
+      activePointer = null;
+      tapPointers.clear();
+      if (tapCandidate) clearTimeout(tapCandidate.timer);
+      tapCandidate = previousTap = null;
+    }
+  };
+  eraseMode.onclick = () => setMode(mode === 'erase' ? 'draw' : 'erase');
+  undo.onclick = () => { if (pageStrokes().length) { clearNativePreview(); pageStrokes().pop(); redrawInk(); saveInk(); } };
+  clear.onclick = () => { if (pageStrokes().length && window.confirm('Clear ink from this page?')) { clearNativePreview(); inks.pages[page] = []; redrawInk(); saveInk(); } };
+
+  function fail(error) {
+    status.textContent = String(error && error.message || error);
+    send({type: 'error', message: status.textContent});
+  }
+  function updateButtons() {
+    prev.disabled = busy || !doc || page <= 1;
+    next.disabled = busy || !doc || page >= count;
+    minus.disabled = !doc || zoom <= 0.01;
+    plus.disabled = !doc || zoom >= 4;
+    fitWidth.disabled = fitHeight.disabled = !doc;
+    counter.disabled = !doc || busy;
+    fitWidth.classList.toggle('active', fitMode === 'width');
+    fitHeight.classList.toggle('active', fitMode === 'height');
+    counter.textContent = doc ? page + ' / ' + count : '– / –';
+  }
+  async function renderPage() {
+    if (!doc || busy) return;
+    const started = performance.now();
+    busy = true;
+    pruneDistantImages();
+    clearNativePreview(true);
+    sendPenRegion();
+    updateButtons();
+    status.textContent = 'Rendering page ' + page + '…';
+    try {
+      let image = cachedImage(page);
+      const fromCache = !!image;
+      if (!image) {
+        const djvuPage = await doc.getPage(page);
+        image = djvuPage.getImageData();
+        cacheImage(page, image);
+      }
+      canvas.width = image.width;
+      canvas.height = image.height;
+      inkCanvas.width = image.width;
+      inkCanvas.height = image.height;
+      canvas.getContext('2d', {alpha: false}).putImageData(image, 0, 0);
+      if (fitMode === 'width') zoom = area.clientWidth / image.width;
+      if (fitMode === 'height') zoom = area.clientHeight / image.height;
+      setZoom(zoom);
+      redrawInk();
+      area.scrollTop = 0;
+      area.scrollLeft = 0;
+      status.textContent = 'Page ' + page + ' of ' + count;
+      send({type: 'page', page: page, count: count});
+      send({type: 'renderTime', page, ms: Math.round(performance.now() - started), fromCache});
+    } catch (error) { fail(error); }
+    busy = false;
+    updateButtons();
+    saveViewState();
+    queuePenRegion();
+    queuePrefetch();
+  }
+  function setZoom(value) {
+    zoom = Math.max(0.01, Math.min(4, value));
+    if (canvas.width) {
+      const width = Math.round(canvas.width * zoom) + 'px';
+      const height = Math.round(canvas.height * zoom) + 'px';
+      canvas.style.width = inkCanvas.style.width = pageWrap.style.width = width;
+      canvas.style.height = inkCanvas.style.height = pageWrap.style.height = height;
+    }
+    updateButtons();
+    saveViewState();
+    queuePenRegion();
+  }
+  prev.onclick = () => { if (page > 1 && !busy) { page--; renderPage(); } };
+  next.onclick = () => { if (page < count && !busy) { page++; renderPage(); } };
+  counter.onclick = () => {
+    if (!doc || busy) return;
+    jumpInput.max = String(count);
+    jumpInput.value = String(page);
+    jumpError.textContent = '';
+    jumpDialog.hidden = false;
+    sendPenRegion();
+    jumpInput.focus();
+    jumpInput.select();
+  };
+  jumpCancel.onclick = () => { jumpDialog.hidden = true; queuePenRegion(); };
+  jumpGo.onclick = () => {
+    const target = Number(jumpInput.value);
+    if (!Number.isInteger(target) || target < 1 || target > count) {
+      jumpError.textContent = 'Enter a page from 1 to ' + count + '.';
+      jumpInput.focus();
+      return;
+    }
+    jumpDialog.hidden = true;
+    queuePenRegion();
+    if (target !== page) { page = target; renderPage(); }
+  };
+  jumpInput.onkeydown = event => {
+    if (event.key === 'Enter') jumpGo.click();
+    if (event.key === 'Escape') jumpCancel.click();
+  };
+  function fitPage(mode) {
+    if (!doc || !canvas.width || !canvas.height) return;
+    fitMode = mode;
+    setZoom(mode === 'width' ? area.clientWidth / canvas.width : area.clientHeight / canvas.height);
+    area.scrollTop = 0;
+    area.scrollLeft = 0;
+    saveViewState();
+  }
+  fitWidth.onclick = () => fitPage('width');
+  fitHeight.onclick = () => fitPage('height');
+  minus.onclick = () => { fitMode = null; setZoom(zoom / 1.25); };
+  plus.onclick = () => { fitMode = null; setZoom(zoom * 1.25); };
+  window.addEventListener('resize', () => { if (fitMode) fitPage(fitMode); });
+  area.addEventListener('scroll', () => {
+    clearNativePreview();
+    queuePenRegion();
+    clearTimeout(viewStateTimer);
+    viewStateTimer = setTimeout(saveViewState, 300);
+  });
+  let fingerDrag = null;
+  area.addEventListener('pointerdown', event => {
+    if (!doc || busy || event.pointerType === 'pen' ||
+        event.pointerType === 'mouse' || activePointer !== null || fingerDrag) return;
+    fingerDrag = {id: event.pointerId, x: event.clientX, y: event.clientY,
+      scrollTop: area.scrollTop, scrollLeft: area.scrollLeft};
+  }, true);
+  area.addEventListener('pointermove', event => {
+    if (!fingerDrag || event.pointerId !== fingerDrag.id) return;
+    area.scrollTop = fingerDrag.scrollTop - (event.clientY - fingerDrag.y);
+    area.scrollLeft = fingerDrag.scrollLeft - (event.clientX - fingerDrag.x);
+  });
+  area.addEventListener('pointerup', event => {
+    if (!fingerDrag || event.pointerId !== fingerDrag.id) return;
+    const dx = event.clientX - fingerDrag.x;
+    const dy = event.clientY - fingerDrag.y;
+    fingerDrag = null;
+    if (pageWrap.getBoundingClientRect().width > area.clientWidth + 2 ||
+        Math.abs(dx) < 80 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+    if (dx < 0) next.click();
+    else prev.click();
+  });
+  area.addEventListener('pointercancel', event => {
+    if (fingerDrag && event.pointerId === fingerDrag.id) fingerDrag = null;
+  });
+  // Keep the ink from before the first tap so a gesture does not leave tap marks
+  // or erase strokes before Undo or the toolbar toggle takes effect.
+  const tapPointers = new Map();
+  let tapCandidate = null, previousTap = null;
+  function finishTap() {
+    if (!tapCandidate || tapPointers.size) return;
+    const candidate = tapCandidate;
+    tapCandidate = null;
+    clearTimeout(candidate.timer);
+    if (candidate.moved || candidate.page !== page ||
+        candidate.lastEnded - candidate.started > 400) {
+      previousTap = null;
+      return;
+    }
+    const center = candidate.points.reduce((point, item) => ({x: point.x + item.x, y: point.y + item.y}), {x: 0, y: 0});
+    center.x /= candidate.points.length;
+    center.y /= candidate.points.length;
+    const tap = {time: candidate.lastEnded, count: candidate.points.length, center, page,
+      beforeInk: candidate.beforeInk};
+    if (previousTap && previousTap.count === tap.count && previousTap.page === tap.page &&
+        tap.time - previousTap.time <= 900 &&
+        Math.hypot(center.x - previousTap.center.x, center.y - previousTap.center.y) <= 90) {
+      clearNativePreview();
+      inks.pages[page] = previousTap.beforeInk;
+      if (tap.count === 1 && inks.pages[page].length) inks.pages[page].pop();
+      redrawInk();
+      saveInk();
+      if (tap.count === 2) {
+        const hidden = root.classList.toggle('toolbarsHidden');
+        send({type: 'toolbars', visible: !hidden});
+        if (fitMode) fitPage(fitMode);
+        queuePenRegion();
+        saveViewState();
+      }
+      previousTap = null;
+    } else previousTap = tap;
+  }
+  area.addEventListener('pointerdown', event => {
+    if (!doc || busy || event.pointerType === 'mouse' || event.pointerType === 'pen' ||
+        activePointer !== null) return;
+    if (tapCandidate && !tapPointers.size) {
+      const last = tapCandidate.points[0];
+      const nearSameSpot = Math.hypot(event.clientX - last.x, event.clientY - last.y) < 45;
+      if (Date.now() - tapCandidate.lastEnded > 220 ||
+          Date.now() - tapCandidate.started > 300 || nearSameSpot) finishTap();
+      else clearTimeout(tapCandidate.timer);
+    }
+    if (!tapCandidate) {
+      tapCandidate = {started: Date.now(), lastEnded: 0, timer: null, page, points: [], moved: false,
+        beforeInk: JSON.parse(JSON.stringify(pageStrokes()))};
+    }
+    tapPointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+    tapCandidate.points.push({x: event.clientX, y: event.clientY});
+    if (tapCandidate.points.length > 2) tapCandidate.moved = true;
+  }, true);
+  area.addEventListener('pointermove', event => {
+    const start = tapPointers.get(event.pointerId);
+    if (start && tapCandidate && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 30) {
+      tapCandidate.moved = true;
+    }
+  });
+  area.addEventListener('pointerup', event => {
+    if (!tapPointers.has(event.pointerId)) return;
+    tapPointers.delete(event.pointerId);
+    if (tapPointers.size || !tapCandidate) return;
+    tapCandidate.lastEnded = Date.now();
+    tapCandidate.timer = setTimeout(finishTap, 220);
+  });
+  area.addEventListener('pointercancel', event => {
+    tapPointers.delete(event.pointerId);
+    if (tapCandidate) clearTimeout(tapCandidate.timer);
+    tapCandidate = null;
+    previousTap = null;
+  });
+
+  window.startFile = function (size, name, inkJson, viewJson) {
+    try {
+      if (!Number.isSafeInteger(size) || size < 1 || size > 268435456) throw new Error('File must be between 1 byte and 256 MB');
+      const savedInk = JSON.parse(inkJson);
+      inks = savedInk && savedInk.version === 1 && savedInk.pages && typeof savedInk.pages === 'object'
+        ? savedInk : {version: 1, pages: {}};
+      try { restoredView = JSON.parse(viewJson || '{}') || {}; }
+      catch (_) { restoredView = {}; }
+      viewStateReady = false;
+      clearTimeout(prefetchTimer);
+      if (prefetchWorker) prefetchWorker.terminate();
+      prefetchWorker = workerReady = null;
+      imageCache.clear();
+      cachedBytes = 0;
+      bytes = new Uint8Array(size);
+      offset = 0;
+      status.textContent = 'Loading ' + name + '…';
+      send({type: 'read', offset: 0});
+    } catch (error) { fail(error); }
+  };
+  window.receiveChunk = async function (base64) {
+    try {
+      const binary = atob(base64);
+      for (let i = 0; i < binary.length; i++) bytes[offset + i] = binary.charCodeAt(i);
+      offset += binary.length;
+      if (offset < bytes.length) {
+        if (offset % (1024 * 1024) < binary.length) status.textContent = 'Loading ' + Math.round(offset * 100 / bytes.length) + '%';
+        send({type: 'read', offset: offset});
+        return;
+      }
+      doc = new DjVu.Document(bytes.buffer);
+      startPrefetchWorker(bytes.buffer);
+      bytes = null;
+      count = doc.getPagesQuantity();
+      if (!count) throw new Error('No pages in document');
+      const savedPage = Number(restoredView.page);
+      page = Number.isInteger(savedPage) ? Math.max(1, Math.min(count, savedPage)) : 1;
+      fitMode = restoredView.fitMode === 'height' ? 'height' :
+        restoredView.fitMode === null ? null : 'width';
+      zoom = Number.isFinite(restoredView.zoom) && restoredView.zoom > 0 ? restoredView.zoom : 1;
+      setMode(restoredView.mode === 'erase' ? 'erase' : 'draw');
+      root.classList.toggle('toolbarsHidden', restoredView.toolbarsVisible === false);
+      send({type: 'toolbars', visible: restoredView.toolbarsVisible !== false});
+      await renderPage();
+      if (Number.isFinite(restoredView.scrollTop)) area.scrollTop = Math.max(0, restoredView.scrollTop);
+      if (Number.isFinite(restoredView.scrollLeft)) area.scrollLeft = Math.max(0, restoredView.scrollLeft);
+      viewStateReady = true;
+      saveViewState();
+      queuePenRegion();
+    } catch (error) { fail(error); }
+  };
+  window.readerError = fail;
+  send({type: 'ready'});
+})();
+</script></body></html>
